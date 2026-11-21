@@ -358,6 +358,11 @@ class RequestResponseCycle:
         self.chunked_encoding = False
         self.expected_content_length = 0
 
+        # Set while the response head is held back and the body is buffered,
+        # for HTTP/1.0 responses that declare no length; see send().
+        self.deferred_head: tuple[int, list[tuple[bytes, bytes]]] | None = None
+        self.deferred_body = bytearray()
+
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
         try:
@@ -403,6 +408,23 @@ class RequestResponseCycle:
             "more_body": False,
         }
         await self.send(response_body_event)
+
+    def send_deferred_response(self) -> None:
+        """Write out a response whose head was held back while the body was buffered.
+
+        The Content-Length is only known once the application completes the
+        body, so the head goes out now, followed by the buffered body.
+        """
+        assert self.deferred_head is not None
+        status, headers = self.deferred_head
+        self.deferred_head = None
+        headers = headers + [(b"content-length", str(len(self.deferred_body)).encode("ascii"))]
+        self.conn.send_response(status, headers)
+        self.transport.write(self.conn.data_to_send())
+        if self.deferred_body:
+            self.conn.send_data(bytes(self.deferred_body))
+            self.transport.write(self.conn.data_to_send())
+            self.deferred_body.clear()
 
     # ASGI interface
     async def send(self, message: ASGISendEvent) -> None:
@@ -454,10 +476,17 @@ class RequestResponseCycle:
 
             # zttp refuses to frame the body unless the response declares
             # Content-Length or Transfer-Encoding, so add chunked encoding
-            # ourselves when the application provides neither.
+            # ourselves when the application provides neither. A chunked
+            # response must not be sent to an HTTP/1.0 client (RFC 9112
+            # §6.1), and zttp cannot frame a body by closing the connection,
+            # so for HTTP/1.0 the head is held back instead, and the body is
+            # buffered and answered with a Content-Length once it completes.
             if not bodyless and not has_transfer_encoding and not has_content_length:
-                self.chunked_encoding = True
-                headers = headers + [(b"transfer-encoding", b"chunked")]
+                if self.scope["http_version"] == "1.0":
+                    self.deferred_head = (status, headers)
+                else:
+                    self.chunked_encoding = True
+                    headers = headers + [(b"transfer-encoding", b"chunked")]
 
             if self.access_log:
                 self.access_logger.info(
@@ -471,8 +500,9 @@ class RequestResponseCycle:
 
             # Write response status line and headers
             self.bodyless = bodyless
-            self.conn.send_response(status, headers)
-            self.transport.write(self.conn.data_to_send())
+            if self.deferred_head is None:
+                self.conn.send_response(status, headers)
+                self.transport.write(self.conn.data_to_send())
 
         elif not self.response_complete:
             # Sending response body
@@ -485,6 +515,8 @@ class RequestResponseCycle:
             # Write response body
             if self.bodyless:
                 self.expected_content_length = 0
+            elif self.deferred_head is not None:
+                self.deferred_body += body
             elif self.chunked_encoding:
                 if body:
                     self.conn.send_data(body)
@@ -499,7 +531,9 @@ class RequestResponseCycle:
 
             # Handle response completion
             if not more_body:
-                if self.expected_content_length != 0:
+                if self.deferred_head is not None:
+                    self.send_deferred_response()
+                elif self.expected_content_length != 0:
                     raise RuntimeError("Response content shorter than Content-Length")
                 self.response_complete = True
                 self.message_event.set()

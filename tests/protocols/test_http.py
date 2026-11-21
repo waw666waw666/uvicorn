@@ -26,6 +26,13 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     skip_if_no_httptools = pytest.mark.skipif(True, reason="httptools is not installed")
 
+try:
+    from uvicorn.protocols.http.zttp_impl import ZttpProtocol
+
+    skip_if_no_zttp = pytest.mark.skipif(False, reason="zttp is installed")
+except ModuleNotFoundError:  # pragma: no cover
+    skip_if_no_zttp = pytest.mark.skipif(True, reason="zttp is not installed")
+
 if TYPE_CHECKING:
     from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
     from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
@@ -1226,6 +1233,65 @@ async def test_httptools_http10_keep_alive_disabled() -> None:
 
     assert protocol.transport.is_closing()
     assert b"connection: close\r\n" in protocol.transport.buffer.lower()
+
+
+async def _streaming_app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+    assert scope["type"] == "http"
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/plain")],
+        }
+    )
+    await send({"type": "http.response.body", "body": b"Hello, ", "more_body": True})
+    await send({"type": "http.response.body", "body": b"world", "more_body": False})
+
+
+@skip_if_no_zttp
+async def test_zttp_http10_response_without_length_is_not_chunked() -> None:
+    """RFC 9112 §6.1 forbids sending a chunked response to an HTTP/1.0 client.
+
+    zttp cannot frame a response body by closing the connection, so the body
+    is buffered and answered with a Content-Length instead of the chunked
+    coding the cycle adds for HTTP/1.1 responses.
+    """
+    protocol = get_connected_protocol(_streaming_app, ZttpProtocol)  # type: ignore[arg-type]
+    protocol.data_received(HTTP10_GET_REQUEST)
+    await protocol.loop.run_one()
+
+    assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
+    assert b"transfer-encoding" not in protocol.transport.buffer.lower()
+    assert b"content-length: 12" in protocol.transport.buffer.lower()
+    assert protocol.transport.buffer.endswith(b"Hello, world")
+    assert protocol.transport.is_closing()
+
+
+@skip_if_no_zttp
+async def test_zttp_http10_keep_alive_response_without_length_is_not_chunked() -> None:
+    protocol = get_connected_protocol(_streaming_app, ZttpProtocol)  # type: ignore[arg-type]
+    request = b"GET / HTTP/1.0\r\nHost: example.org\r\nConnection: keep-alive\r\n\r\n"
+    protocol.data_received(request)
+    await protocol.loop.run_one()
+
+    assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
+    assert b"transfer-encoding" not in protocol.transport.buffer.lower()
+    assert b"content-length: 12" in protocol.transport.buffer.lower()
+    assert protocol.transport.buffer.endswith(b"Hello, world")
+    assert not protocol.transport.is_closing()
+
+
+@skip_if_no_zttp
+async def test_zttp_http11_response_without_length_is_chunked() -> None:
+    protocol = get_connected_protocol(_streaming_app, ZttpProtocol)  # type: ignore[arg-type]
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    await protocol.loop.run_one()
+
+    assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
+    assert b"transfer-encoding: chunked" in protocol.transport.buffer.lower()
+    assert b"Hello, " in protocol.transport.buffer
+    assert b"world" in protocol.transport.buffer
+    assert not protocol.transport.is_closing()
 
 
 async def test_close_connection_with_multiple_requests(http_protocol_cls: type[HTTPProtocol]):
